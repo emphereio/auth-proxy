@@ -17,8 +17,8 @@ import (
 func Logging() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Skip logging for health checks to reduce noise if requested frequently
-			if r.URL.Path == "/health" && zerolog.GlobalLevel() != zerolog.DebugLevel {
+			// Skip logging only when not in debug mode and path is /health
+			if r.URL.Path == "/health" && zerolog.GlobalLevel() > zerolog.DebugLevel {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -43,7 +43,7 @@ func Logging() func(http.Handler) http.Handler {
 			duration := time.Since(start)
 
 			// Get tenant ID if available
-			tenantID, _ := GetTenantID(r)
+			tenantID, _ := r.Context().Value(tenantIDKey).(string)
 
 			// Create log event with appropriate level based on status code
 			var event *zerolog.Event

@@ -4,6 +4,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"time"
 
@@ -52,6 +53,21 @@ func New(cfg *config.Config, reverseProxy *proxy.ReverseProxy, opaEngine *opa.En
 func (s *Server) Start() error {
 	log.Info().Str("port", s.cfg.Port).Msg("Server listening")
 	return s.server.ListenAndServe()
+}
+
+// GetListener creates and returns a listener for the server
+func (s *Server) GetListener() (net.Listener, error) {
+	return net.Listen("tcp", ":"+s.cfg.Port)
+}
+
+// StartWithListener starts the server using a provided listener
+func (s *Server) StartWithListener(listener net.Listener) error {
+	// Update the address to show what we're actually listening on
+	addr := listener.Addr().String()
+	log.Info().Str("port", addr).Msg("Server listening")
+
+	// Serve using the provided listener
+	return s.server.Serve(listener)
 }
 
 // Shutdown gracefully shuts down the server

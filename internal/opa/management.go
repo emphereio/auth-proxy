@@ -85,7 +85,7 @@ allow {
     input.attributes.request.http.headers["x-tenant-id"] != ""
     
     # Check if tenant IDs match
-    input.attributes.request.http.headers["x-tenant-id"] == input.attributes.request.http.headers["authorization"]
+    input.attributes.request.http.headers["x-tenant-id"] == input.expected_tenant_id
 }
 
 # Additional allow rule for OPTIONS requests (CORS preflight)
