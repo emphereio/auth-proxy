@@ -30,6 +30,7 @@ func NewWatcher(engine *Engine, policyDir string) (*Watcher, error) {
 		interval:     30 * time.Second, // Default interval
 		stopChan:     make(chan struct{}),
 		lastModified: make(map[string]time.Time),
+		running:      false,
 	}
 
 	// Initialize last modified times
@@ -65,6 +66,9 @@ func (w *Watcher) Start() {
 		case <-ticker.C:
 			w.checkForChanges()
 		case <-w.stopChan:
+			w.mutex.Lock()
+			w.running = false
+			w.mutex.Unlock()
 			log.Info().Msg("Policy watcher stopped")
 			return
 		}
@@ -141,7 +145,12 @@ func (w *Watcher) checkForChanges() {
 				continue
 			}
 
-			w.engine.UpdatePolicy(entry.Name(), string(content))
+			err = w.engine.UpdatePolicy(entry.Name(), string(content))
+			if err != nil {
+				log.Error().Err(err).Str("file", filePath).Msg("Failed to update engine with new policy")
+				continue
+			}
+
 			added = append(added, entry.Name())
 			changed = true
 		} else if info.ModTime().After(lastMod) {
@@ -152,7 +161,12 @@ func (w *Watcher) checkForChanges() {
 				continue
 			}
 
-			w.engine.UpdatePolicy(entry.Name(), string(content))
+			err = w.engine.UpdatePolicy(entry.Name(), string(content))
+			if err != nil {
+				log.Error().Err(err).Str("file", filePath).Msg("Failed to update engine with modified policy")
+				continue
+			}
+
 			modified = append(modified, entry.Name())
 			changed = true
 		}

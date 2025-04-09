@@ -74,6 +74,7 @@ func Auth(opaEngine *opa.Engine, cfg *config.Config) func(http.Handler) http.Han
 					Str("method", r.Method).
 					Str("tenantID", tenantID).
 					Str("expectedTenantID", expectedTenantID).
+					Str("host", r.Host).
 					Msg("Tenant authorization denied")
 				respondWithError(w, http.StatusForbidden, "Tenant authorization denied")
 				return
@@ -139,12 +140,17 @@ func createOPAInput(r *http.Request, authHeader, tenantID, expectedTenantID stri
 	// Create headers map
 	headers := make(map[string]string)
 	for name, values := range r.Header {
-		headers[strings.ToLower(name)] = values[0]
+		if len(values) > 0 {
+			headers[strings.ToLower(name)] = values[0]
+		}
 	}
 
 	// Add/override specific headers
 	headers["authorization"] = authHeader
 	headers["x-tenant-id"] = tenantID
+
+	// Extract host tenant ID
+	hostTenantID := jwt.ExtractTenantIDFromHost(r.Host)
 
 	// Build the input structure expected by OPA
 	return map[string]interface{}{
@@ -155,10 +161,12 @@ func createOPAInput(r *http.Request, authHeader, tenantID, expectedTenantID stri
 					"method":  r.Method,
 					"path":    r.URL.Path,
 					"query":   r.URL.RawQuery,
+					"host":    r.Host,
 				},
 			},
 		},
 		"expected_tenant_id": expectedTenantID,
+		"host_tenant_id":     hostTenantID,
 	}
 }
 

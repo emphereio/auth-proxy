@@ -4,6 +4,7 @@ package middleware
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -149,7 +150,8 @@ func GetMetrics() map[string]interface{} {
 	// Build status code metrics
 	statusMetrics := make(map[string]int64)
 	for status, count := range metricsCollector.requestsByStatus {
-		statusMetrics[string(status)] = count
+		// FIX: Use strconv.Itoa instead of string() conversion
+		statusMetrics[strconv.Itoa(status)] = count
 	}
 
 	// Build method metrics

@@ -15,20 +15,28 @@ func Setup() {
 	// Configure timestamp format
 	zerolog.TimeFieldFormat = time.RFC3339
 
-	// Determine log format (json or console)
-	logFormat := strings.ToLower(getEnv("LOG_FORMAT", "json"))
-	if logFormat == "console" {
-		log.Logger = log.Output(zerolog.ConsoleWriter{
-			Out:        os.Stdout,
-			TimeFormat: time.RFC3339,
-			NoColor:    getEnv("LOG_NO_COLOR", "") != "",
-		})
-	}
-
 	// Set log level
 	setLogLevel(getEnv("LOG_LEVEL", "info"))
 
-	// Add service name if available
+	// Determine log format (json or console)
+	logFormat := strings.ToLower(getEnv("LOG_FORMAT", "json"))
+
+	if logFormat == "console" {
+		// Create console writer
+		noColor := getEnv("LOG_NO_COLOR", "") != ""
+		consoleWriter := zerolog.ConsoleWriter{
+			Out:        os.Stdout,
+			TimeFormat: time.RFC3339,
+			NoColor:    noColor,
+		}
+		// Create logger with console writer
+		log.Logger = zerolog.New(consoleWriter).With().Timestamp().Logger()
+	} else {
+		// Default to JSON format with timestamps
+		log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
+	}
+
+	// Add service name to all logs
 	serviceName := getEnv("SERVICE_NAME", "auth-proxy")
 	log.Logger = log.With().Str("service", serviceName).Logger()
 }
