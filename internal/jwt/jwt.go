@@ -36,42 +36,81 @@ func ExtractTokenFromHeader(authHeader string) string {
 
 // DecodePayload decodes the payload portion of a JWT token
 func DecodePayload(token string) (*Payload, error) {
-	// Strip any Bearer prefix
-	token = strings.TrimPrefix(token, "Bearer ")
+	log.Debug().
+		Str("raw_token", token).
+		Msg("Attempting to decode payload")
 
-	// Split the token to get the payload part (second part)
+	// First, try splitting by dots (full JWT)
 	parts := strings.Split(token, ".")
-	if len(parts) < 2 {
-		return nil, fmt.Errorf("invalid token format: expected at least 2 parts")
+
+	var payloadBase64 string
+	if len(parts) >= 2 {
+		// Full JWT, use second part
+		payloadBase64 = parts[1]
+	} else {
+		// Assume it's already a base64 encoded payload
+		payloadBase64 = token
 	}
 
-	// Get the payload part
-	payloadBase64 := parts[1]
+	log.Debug().
+		Str("payload_base64", payloadBase64).
+		Msg("Using payload base64")
 
-	// Add padding if needed
-	if padding := len(payloadBase64) % 4; padding > 0 {
-		payloadBase64 += strings.Repeat("=", 4-padding)
-	}
-
-	// Try standard base64 decoding first
-	payloadJSON, err := base64.StdEncoding.DecodeString(payloadBase64)
-	if err != nil {
-		// If that fails, try URL-safe base64 decoding
-		payloadJSON, err = base64.URLEncoding.DecodeString(payloadBase64)
-		if err != nil {
-			// If that fails too, try Raw URL-safe base64 decoding
-			payloadJSON, err = base64.RawURLEncoding.DecodeString(payloadBase64)
-			if err != nil {
-				return nil, fmt.Errorf("failed to decode token payload: %w", err)
+	// Try decoding methods
+	decodingMethods := []func(string) ([]byte, error){
+		base64.RawURLEncoding.DecodeString,
+		base64.StdEncoding.DecodeString,
+		func(s string) ([]byte, error) {
+			if padding := len(s) % 4; padding > 0 {
+				s += strings.Repeat("=", 4-padding)
 			}
+			return base64.RawURLEncoding.DecodeString(s)
+		},
+		func(s string) ([]byte, error) {
+			if padding := len(s) % 4; padding > 0 {
+				s += strings.Repeat("=", 4-padding)
+			}
+			return base64.StdEncoding.DecodeString(s)
+		},
+	}
+
+	var payloadJSON []byte
+	var err error
+	for i, decodeFunc := range decodingMethods {
+		payloadJSON, err = decodeFunc(payloadBase64)
+		if err == nil {
+			log.Debug().
+				Int("attempt", i+1).
+				Msg("Successfully decoded payload")
+			break
+		} else {
+			log.Debug().
+				Int("attempt", i+1).
+				Err(err).
+				Msg("Payload decoding attempt failed")
 		}
+	}
+
+	if err != nil {
+		log.Error().
+			Str("payload_base64", payloadBase64).
+			Msg("Failed to decode payload")
+		return nil, fmt.Errorf("failed to decode token payload: %w", err)
 	}
 
 	// Parse the JSON payload
 	var payload Payload
 	if err := json.Unmarshal(payloadJSON, &payload); err != nil {
+		log.Error().
+			Err(err).
+			RawJSON("payload_json", payloadJSON).
+			Msg("Failed to parse payload JSON")
 		return nil, fmt.Errorf("failed to parse token payload: %w", err)
 	}
+
+	log.Debug().
+		Str("tenantId", payload.TenantID).
+		Msg("Decoded payload with tenant ID")
 
 	return &payload, nil
 }
@@ -92,30 +131,45 @@ func ExtractTenantIDFromHost(host string) string {
 
 // ExtractTenantID extracts the tenant ID from the request
 func ExtractTenantID(r *http.Request) string {
+	log.Debug().
+		Str("x-endpoint-api-userinfo", r.Header.Get("x-endpoint-api-userinfo")).
+		Str("host", r.Host).
+		Msg("Extracting tenant ID")
+
 	// Try to get from endpoint API userinfo header
 	userInfoHeader := r.Header.Get("x-endpoint-api-userinfo")
-	if userInfoHeader != "" {
-		payload, err := DecodePayload(userInfoHeader)
-		if err == nil {
-			// Check tenantId field first
-			if payload.TenantID != "" {
-				log.Debug().Str("source", "userinfo.tenantId").Str("tenantID", payload.TenantID).Msg("Found tenant ID")
-				return payload.TenantID
-			}
-
-			// Try Firebase tenant
-			if payload.Firebase.Tenant != "" {
-				log.Debug().Str("source", "userinfo.firebase.tenant").Str("tenantID", payload.Firebase.Tenant).Msg("Found tenant ID")
-				return payload.Firebase.Tenant
-			}
-		}
+	if userInfoHeader == "" {
+		log.Warn().Msg("x-endpoint-api-userinfo header is empty")
+		return ""
 	}
 
-	// Try to get from header directly as fallback
-	if tenantID := r.Header.Get("X-Tenant-ID"); tenantID != "" {
-		log.Debug().Str("source", "header").Str("tenantID", tenantID).Msg("Found tenant ID")
-		return tenantID
+	payload, err := DecodePayload(userInfoHeader)
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("userInfoHeader", userInfoHeader).
+			Msg("Failed to decode payload")
+		return ""
 	}
 
+	// Check tenantId field first
+	if payload.TenantID != "" {
+		log.Debug().
+			Str("source", "userinfo.tenantId").
+			Str("tenantID", payload.TenantID).
+			Msg("Found tenant ID")
+		return payload.TenantID
+	}
+
+	// Try Firebase tenant
+	if payload.Firebase.Tenant != "" {
+		log.Debug().
+			Str("source", "userinfo.firebase.tenant").
+			Str("tenantID", payload.Firebase.Tenant).
+			Msg("Found tenant ID")
+		return payload.Firebase.Tenant
+	}
+
+	log.Warn().Msg("No tenant ID found in payload")
 	return ""
 }
