@@ -132,22 +132,26 @@ func ExtractTenantIDFromHost(host string) string {
 // ExtractTenantID extracts the tenant ID from the request
 func ExtractTenantID(r *http.Request) string {
 	log.Debug().
-		Str("x-endpoint-api-userinfo", r.Header.Get("x-endpoint-api-userinfo")).
+		Str("authorization", r.Header.Get("Authorization")).
 		Str("host", r.Host).
 		Msg("Extracting tenant ID")
 
-	// Try to get from endpoint API userinfo header
-	userInfoHeader := r.Header.Get("x-endpoint-api-userinfo")
-	if userInfoHeader == "" {
-		log.Warn().Msg("x-endpoint-api-userinfo header is empty")
+	// Try to get from Authorization header
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		log.Warn().Msg("Authorization header is empty")
 		return ""
 	}
 
-	payload, err := DecodePayload(userInfoHeader)
+	// Extract token from Authorization header
+	token := ExtractTokenFromHeader(authHeader)
+
+	// Decode the token payload
+	payload, err := DecodePayload(token)
 	if err != nil {
 		log.Error().
 			Err(err).
-			Str("userInfoHeader", userInfoHeader).
+			Str("token", token).
 			Msg("Failed to decode payload")
 		return ""
 	}
@@ -155,7 +159,7 @@ func ExtractTenantID(r *http.Request) string {
 	// Check tenantId field first
 	if payload.TenantID != "" {
 		log.Debug().
-			Str("source", "userinfo.tenantId").
+			Str("source", "token.tenantId").
 			Str("tenantID", payload.TenantID).
 			Msg("Found tenant ID")
 		return payload.TenantID
@@ -164,7 +168,7 @@ func ExtractTenantID(r *http.Request) string {
 	// Try Firebase tenant
 	if payload.Firebase.Tenant != "" {
 		log.Debug().
-			Str("source", "userinfo.firebase.tenant").
+			Str("source", "token.firebase.tenant").
 			Str("tenantID", payload.Firebase.Tenant).
 			Msg("Found tenant ID")
 		return payload.Firebase.Tenant
