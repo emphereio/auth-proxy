@@ -149,9 +149,6 @@ func createOPAInput(r *http.Request, authHeader, tenantID, expectedTenantID stri
 	headers["authorization"] = authHeader
 	headers["x-tenant-id"] = tenantID
 
-	// Extract host tenant ID
-	hostTenantID := jwt.ExtractTenantIDFromHost(r.Host)
-
 	// Build the input structure expected by OPA
 	return map[string]interface{}{
 		"attributes": map[string]interface{}{
@@ -166,7 +163,6 @@ func createOPAInput(r *http.Request, authHeader, tenantID, expectedTenantID stri
 			},
 		},
 		"expected_tenant_id": expectedTenantID,
-		"host_tenant_id":     hostTenantID,
 	}
 }
 
@@ -174,17 +170,4 @@ func createOPAInput(r *http.Request, authHeader, tenantID, expectedTenantID stri
 func GetTenantID(r *http.Request) (string, bool) {
 	tenantID, ok := r.Context().Value(tenantIDKey).(string)
 	return tenantID, ok
-}
-
-// RequireTenant is a helper that wraps handlers requiring a tenant ID
-func RequireTenant(handler func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		tenantID, ok := GetTenantID(r)
-		if !ok || tenantID == "" {
-			respondWithError(w, http.StatusForbidden, "Tenant ID required")
-			return
-		}
-
-		handler(w, r, tenantID)
-	}
 }

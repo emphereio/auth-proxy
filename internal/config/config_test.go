@@ -21,7 +21,7 @@ func TestLoad(t *testing.T) {
 		assert.Equal(t, "8080", cfg.Port)
 		assert.Equal(t, "localhost", cfg.BackendHost)
 		assert.Equal(t, "8000", cfg.BackendPort)
-		assert.Equal(t, "/policies", cfg.PolicyDir)
+		assert.Equal(t, "../policies", cfg.PolicyDir)
 		assert.Equal(t, 10*time.Second, cfg.RequestTimeout)
 		assert.Equal(t, 10*time.Second, cfg.ShutdownTimeout)
 		assert.Equal(t, 30*time.Second, cfg.PolicyRefreshInterval)

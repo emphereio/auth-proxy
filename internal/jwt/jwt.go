@@ -1,29 +1,96 @@
-// Package jwt provides JWT token parsing and validation
 package jwt
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/golang-jwt/jwt/v4"
 	"github.com/rs/zerolog/log"
 )
 
-// Payload represents a simplified JWT payload structure
-type Payload struct {
-	// Standard claims
-	Subject string `json:"sub,omitempty"`
+const (
+	// FirebasePublicKeysURL is firebase's public key URL
+	FirebasePublicKeysURL = "https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com"
+)
 
-	// Custom claims for tenant identification
+// Store for the public keys with mutex for thread-safe access
+var (
+	publicKeys      map[string]interface{} = make(map[string]interface{})
+	publicKeysMutex                        = &sync.RWMutex{}
+)
+
+// CustomClaims defines the claims we expect in Firebase tokens
+type CustomClaims struct {
+	jwt.RegisteredClaims
 	TenantID string `json:"tenantId,omitempty"`
-	Role     string `json:"role,omitempty"`
-
-	// Nested structures for tenant identification
 	Firebase struct {
 		Tenant string `json:"tenant,omitempty"`
 	} `json:"firebase,omitempty"`
+}
+
+// InitJWTVerification initializes the JWT verification system
+func InitJWTVerification() error {
+	// Fetch public keys immediately on startup
+	if err := fetchFirebasePublicKeys(); err != nil {
+		return err
+	}
+
+	// Start a background goroutine to refresh keys periodically
+	go refreshKeysWorker()
+
+	return nil
+}
+
+// refreshKeysWorker periodically refreshes the public keys
+func refreshKeysWorker() {
+	ticker := time.NewTicker(6 * time.Hour) // Refresh every 6 hours
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if err := fetchFirebasePublicKeys(); err != nil {
+			log.Error().Err(err).Msg("Failed to refresh Firebase public keys")
+		} else {
+			log.Info().Msg("Successfully refreshed Firebase public keys")
+		}
+	}
+}
+
+// fetchFirebasePublicKeys fetches the latest public keys from Firebase
+func fetchFirebasePublicKeys() error {
+	resp, err := http.Get(FirebasePublicKeysURL)
+	if err != nil {
+		return fmt.Errorf("failed to fetch Firebase public keys: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Parse the response
+	var keys map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&keys); err != nil {
+		return fmt.Errorf("failed to parse Firebase public keys: %w", err)
+	}
+
+	// Convert the string keys to crypto objects
+	newKeys := make(map[string]interface{})
+	for kid, cert := range keys {
+		publicKey, err := jwt.ParseRSAPublicKeyFromPEM([]byte(cert))
+		if err != nil {
+			log.Warn().Err(err).Str("kid", kid).Msg("Failed to parse public key, skipping")
+			continue
+		}
+		newKeys[kid] = publicKey
+	}
+
+	// Update keys with a write lock
+	publicKeysMutex.Lock()
+	publicKeys = newKeys
+	publicKeysMutex.Unlock()
+
+	log.Info().Int("keyCount", len(newKeys)).Msg("Loaded Firebase public keys")
+	return nil
 }
 
 // ExtractTokenFromHeader extracts a JWT token from an Authorization header
@@ -34,109 +101,76 @@ func ExtractTokenFromHeader(authHeader string) string {
 	return authHeader
 }
 
-// DecodePayload decodes the payload portion of a JWT token
-func DecodePayload(token string) (*Payload, error) {
-	log.Debug().
-		Str("raw_token", token).
-		Msg("Attempting to decode payload")
+// VerifyToken verifies a Firebase ID token
+func VerifyToken(tokenString string) (*CustomClaims, error) {
+	// Parse the token
+	publicKeysMutex.RLock()
+	currentKeys := publicKeys
+	publicKeysMutex.RUnlock()
 
-	// First, try splitting by dots (full JWT)
-	parts := strings.Split(token, ".")
-
-	var payloadBase64 string
-	if len(parts) >= 2 {
-		// Full JWT, use second part
-		payloadBase64 = parts[1]
-	} else {
-		// Assume it's already a base64 encoded payload
-		payloadBase64 = token
+	if len(currentKeys) == 0 {
+		return nil, fmt.Errorf("no public keys available for verification")
 	}
 
-	log.Debug().
-		Str("payload_base64", payloadBase64).
-		Msg("Using payload base64")
-
-	// Try decoding methods
-	decodingMethods := []func(string) ([]byte, error){
-		base64.RawURLEncoding.DecodeString,
-		base64.StdEncoding.DecodeString,
-		func(s string) ([]byte, error) {
-			if padding := len(s) % 4; padding > 0 {
-				s += strings.Repeat("=", 4-padding)
-			}
-			return base64.RawURLEncoding.DecodeString(s)
-		},
-		func(s string) ([]byte, error) {
-			if padding := len(s) % 4; padding > 0 {
-				s += strings.Repeat("=", 4-padding)
-			}
-			return base64.StdEncoding.DecodeString(s)
-		},
-	}
-
-	var payloadJSON []byte
-	var err error
-	for i, decodeFunc := range decodingMethods {
-		payloadJSON, err = decodeFunc(payloadBase64)
-		if err == nil {
-			log.Debug().
-				Int("attempt", i+1).
-				Msg("Successfully decoded payload")
-			break
-		} else {
-			log.Debug().
-				Int("attempt", i+1).
-				Err(err).
-				Msg("Payload decoding attempt failed")
+	token, err := jwt.ParseWithClaims(tokenString, &CustomClaims{}, func(token *jwt.Token) (interface{}, error) {
+		// Make sure the algorithm is as expected
+		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
-	}
+
+		// Get the key ID
+		kid, ok := token.Header["kid"].(string)
+		if !ok {
+			return nil, fmt.Errorf("token missing key ID")
+		}
+
+		// Get the public key for this kid
+		publicKeysMutex.RLock()
+		key, exists := publicKeys[kid]
+		publicKeysMutex.RUnlock()
+
+		if !exists {
+			// If the key doesn't exist, try refreshing once
+			if err := fetchFirebasePublicKeys(); err != nil {
+				return nil, fmt.Errorf("key ID not found and refresh failed: %w", err)
+			}
+
+			// Check again after refresh
+			publicKeysMutex.RLock()
+			key, exists = publicKeys[kid]
+			publicKeysMutex.RUnlock()
+
+			if !exists {
+				return nil, fmt.Errorf("key ID not found after refresh")
+			}
+		}
+
+		return key, nil
+	})
 
 	if err != nil {
-		log.Error().
-			Str("payload_base64", payloadBase64).
-			Msg("Failed to decode payload")
-		return nil, fmt.Errorf("failed to decode token payload: %w", err)
+		return nil, fmt.Errorf("failed to verify token: %w", err)
 	}
 
-	// Parse the JSON payload
-	var payload Payload
-	if err := json.Unmarshal(payloadJSON, &payload); err != nil {
-		log.Error().
-			Err(err).
-			RawJSON("payload_json", payloadJSON).
-			Msg("Failed to parse payload JSON")
-		return nil, fmt.Errorf("failed to parse token payload: %w", err)
+	if !token.Valid {
+		return nil, fmt.Errorf("token is invalid")
 	}
 
-	log.Debug().
-		Str("tenantId", payload.TenantID).
-		Msg("Decoded payload with tenant ID")
-
-	return &payload, nil
-}
-
-// ExtractTenantIDFromHost extracts the tenant ID from the subdomain
-// e.g., from "tenantid.api.xyz.io" it extracts "tenantid"
-func ExtractTenantIDFromHost(host string) string {
-	// Split the host on dots
-	parts := strings.Split(host, ".")
-
-	// If we have enough parts (subdomain.domain.tld), extract the first part
-	if len(parts) >= 3 {
-		return parts[0]
+	claims, ok := token.Claims.(*CustomClaims)
+	if !ok {
+		return nil, fmt.Errorf("failed to extract custom claims")
 	}
 
-	return ""
+	return claims, nil
 }
 
 // ExtractTenantID extracts the tenant ID from the request
 func ExtractTenantID(r *http.Request) string {
 	log.Debug().
 		Str("authorization", r.Header.Get("Authorization")).
-		Str("host", r.Host).
 		Msg("Extracting tenant ID")
 
-	// Try to get from Authorization header
+	// Get the authorization header
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
 		log.Warn().Msg("Authorization header is empty")
@@ -146,34 +180,34 @@ func ExtractTenantID(r *http.Request) string {
 	// Extract token from Authorization header
 	token := ExtractTokenFromHeader(authHeader)
 
-	// Decode the token payload
-	payload, err := DecodePayload(token)
+	// Verify the token
+	claims, err := VerifyToken(token)
 	if err != nil {
 		log.Error().
 			Err(err).
 			Str("token", token).
-			Msg("Failed to decode payload")
+			Msg("Failed to verify token")
 		return ""
 	}
 
 	// Check tenantId field first
-	if payload.TenantID != "" {
+	if claims.TenantID != "" {
 		log.Debug().
 			Str("source", "token.tenantId").
-			Str("tenantID", payload.TenantID).
+			Str("tenantID", claims.TenantID).
 			Msg("Found tenant ID")
-		return payload.TenantID
+		return claims.TenantID
 	}
 
 	// Try Firebase tenant
-	if payload.Firebase.Tenant != "" {
+	if claims.Firebase.Tenant != "" {
 		log.Debug().
 			Str("source", "token.firebase.tenant").
-			Str("tenantID", payload.Firebase.Tenant).
+			Str("tenantID", claims.Firebase.Tenant).
 			Msg("Found tenant ID")
-		return payload.Firebase.Tenant
+		return claims.Firebase.Tenant
 	}
 
-	log.Warn().Msg("No tenant ID found in payload")
+	log.Warn().Msg("No tenant ID found in claims")
 	return ""
 }

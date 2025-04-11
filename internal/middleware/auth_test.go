@@ -1,22 +1,113 @@
 package middleware
 
 import (
-	"encoding/base64"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/emphereio/auth-proxy/internal/config"
 	"github.com/emphereio/auth-proxy/internal/jwt"
 	"github.com/emphereio/auth-proxy/internal/opa"
+	jwtlib "github.com/golang-jwt/jwt/v4"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// generateTestRSAKey generates a test RSA key pair for JWT signing
+func generateTestRSAKey() (*rsa.PrivateKey, string, error) {
+	// Generate a new RSA key pair
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Create PEM block for the public key
+	publicKeyDer, err := x509.MarshalPKIXPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		return nil, "", err
+	}
+
+	publicKeyBlock := &pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: publicKeyDer,
+	}
+	publicKeyPem := string(pem.EncodeToMemory(publicKeyBlock))
+
+	return privateKey, publicKeyPem, nil
+}
+
+// mockTransport intercepts HTTP requests and redirects them to our test server
+type mockTransport struct {
+	server *httptest.Server
+}
+
+func (m *mockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Only intercept requests to the Firebase public keys URL
+	if req.URL.String() == jwt.FirebasePublicKeysURL {
+		// Create a new request to our test server
+		newReq, err := http.NewRequest(req.Method, m.server.URL, req.Body)
+		if err != nil {
+			return nil, err
+		}
+
+		// Copy headers
+		newReq.Header = req.Header
+
+		// Send the request to our test server
+		return m.server.Client().Do(newReq)
+	}
+
+	// For other requests, use the default transport
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+// generateTestToken generates a signed JWT token for testing
+func generateTestToken(t *testing.T, privateKey *rsa.PrivateKey, kid string, claims *jwt.CustomClaims) string {
+	token := jwtlib.NewWithClaims(jwtlib.SigningMethodRS256, claims)
+	token.Header["kid"] = kid
+
+	// Sign the token with the private key
+	tokenString, err := token.SignedString(privateKey)
+	require.NoError(t, err, "Failed to sign test token")
+	return tokenString
+}
+
+// setupMockFirebaseServer sets up a mock server to simulate Firebase's public key endpoint
+func setupMockFirebaseServer(t *testing.T) (*httptest.Server, string, *rsa.PrivateKey) {
+	// Generate a test RSA key pair
+	privateKey, publicKeyPem, err := generateTestRSAKey()
+	require.NoError(t, err, "Failed to generate test RSA key")
+
+	// Create a mock key ID
+	kid := "test-key-id-1"
+
+	// Setup a mock server that returns our test public key
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Create a response similar to Firebase's format
+		keys := map[string]string{
+			kid: publicKeyPem,
+		}
+
+		// Set cache-control header to test expiry handling
+		w.Header().Set("Cache-Control", "public, max-age=21600")
+		w.Header().Set("Content-Type", "application/json")
+
+		// Write the response
+		json.NewEncoder(w).Encode(keys)
+	}))
+
+	return server, kid, privateKey
+}
 
 func TestAuth(t *testing.T) {
 	// Enable debug logging for the test
@@ -27,39 +118,19 @@ func TestAuth(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
-	// Updated policyContent for auth_test.go without variable reassignment
+	// Updated policyContent for auth_test.go
 	policyContent := `
 package http.authz
 
 default allow = false
 
-# Allow if tenant IDs from JWT and host match
+# Allow if tenant IDs match the expected tenant ID
 allow {
-    # Get tenant ID from JWT userinfo
-    jwt_payload := parse_jwt_payload(input.attributes.request.http.headers["x-endpoint-api-userinfo"])
-    tenant_from_jwt := jwt_payload.tenantId
+    # Get tenant ID from header
+    tenant_id := input.attributes.request.http.headers["x-tenant-id"]
     
-    # Get tenant ID from host
-    host := input.attributes.request.http.host
-    parts := split(host, ".")
-    count(parts) >= 2
-    tenant_from_host := parts[0]
-    
-    # Both tenant IDs exist and match
-    tenant_from_jwt != ""
-    tenant_from_host != "" 
-    tenant_from_jwt == tenant_from_host
-    
-    # Also match against expected tenant ID
-    input.expected_tenant_id == tenant_from_jwt
-}
-
-# Allow if tenant ID from header exactly matches expected
-allow {
-    # Both must exist and match exactly
-    input.attributes.request.http.headers["x-tenant-id"] != ""
-    input.expected_tenant_id != ""
-    input.attributes.request.http.headers["x-tenant-id"] == input.expected_tenant_id
+    # Check against expected tenant ID
+    input.expected_tenant_id == tenant_id
 }
 
 # Allow health and metrics endpoints
@@ -77,36 +148,6 @@ allow {
 allow {
     path := input.attributes.request.http.path
     startswith(path, "/debug/")
-}
-
-# Parse JWT payload from a header
-parse_jwt_payload(header) = payload {
-    header != ""
-    decoded := base64_decode(header)
-    payload := json.unmarshal(decoded)
-} else = {}
-
-# Helper function to decode base64 - fixed version without variable reassignment
-base64_decode(encoded) = decoded {
-    # No padding needed (multiple of 4)
-    remainder := count(encoded) % 4
-    remainder == 0
-    decoded := base64.decode(encoded)
-} else = decoded {
-    # Need 1 padding character
-    remainder := count(encoded) % 4
-    remainder == 3
-    decoded := base64.decode(concat("", [encoded, "="]))
-} else = decoded {
-    # Need 2 padding characters
-    remainder := count(encoded) % 4
-    remainder == 2
-    decoded := base64.decode(concat("", [encoded, "=="]))
-} else = decoded {
-    # Need 3 padding characters
-    remainder := count(encoded) % 4
-    remainder == 1
-    decoded := base64.decode(concat("", [encoded, "==="]))
 }
 `
 
@@ -126,23 +167,44 @@ base64_decode(encoded) = decoded {
 	os.Setenv("TENANT_ID", "test-tenant-123")
 	defer os.Unsetenv("TENANT_ID")
 
+	// Setup mock Firebase server
+	server, kid, privateKey := setupMockFirebaseServer(t)
+	defer server.Close()
+
+	// Save original HTTP client and restore after test
+	originalClient := http.DefaultClient
+	defer func() { http.DefaultClient = originalClient }()
+
+	// Create a custom client that redirects to our test server
+	http.DefaultClient = &http.Client{
+		Transport: &mockTransport{
+			server: server,
+		},
+	}
+
+	// Initialize JWT verification
+	err = jwt.InitJWTVerification()
+	require.NoError(t, err, "Failed to initialize JWT verification")
+
 	// Create the auth middleware
 	authMiddleware := Auth(engine, cfg)
 
 	// Helper function to create test JWT with tenant ID
-	createJWT := func(tenantID string) string {
-		// Create a payload
-		payload := jwt.Payload{
-			Subject:  "user123",
+	createJWT := func(tenantID string, firebaseTenant string) string {
+		claims := &jwt.CustomClaims{
+			RegisteredClaims: jwtlib.RegisteredClaims{
+				Subject:   "user123",
+				ExpiresAt: jwtlib.NewNumericDate(time.Now().Add(time.Hour)),
+				IssuedAt:  jwtlib.NewNumericDate(time.Now()),
+			},
 			TenantID: tenantID,
 		}
-		payloadJSON, _ := json.Marshal(payload)
 
-		// Base64 encode the payload
-		encodedPayload := base64.StdEncoding.EncodeToString(payloadJSON)
+		if firebaseTenant != "" {
+			claims.Firebase.Tenant = firebaseTenant
+		}
 
-		// Add dummy header and signature to make it look like a JWT
-		return "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." + encodedPayload + ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+		return generateTestToken(t, privateKey, kid, claims)
 	}
 
 	// Test cases
@@ -198,7 +260,7 @@ base64_decode(encoded) = decoded {
 			name: "MissingTenantIDReturns403",
 			setupReq: func(req *http.Request) {
 				req.URL.Path = "/secure-endpoint"
-				req.Header.Set("Authorization", "Bearer token123")
+				req.Header.Set("Authorization", "Bearer invalid-token")
 			},
 			expectCode: http.StatusForbidden,
 		},
@@ -206,10 +268,9 @@ base64_decode(encoded) = decoded {
 			name: "WrongTenantIDReturns403",
 			setupReq: func(req *http.Request) {
 				req.URL.Path = "/secure-endpoint"
-				req.Header.Set("Authorization", "Bearer token123")
-				req.Header.Set("X-Tenant-ID", "wrong-tenant")
-				userInfo := createJWT("wrong-tenant")
-				req.Header.Set("x-endpoint-api-userinfo", userInfo)
+				// Set a valid JWT with wrong tenant ID
+				token := createJWT("wrong-tenant", "")
+				req.Header.Set("Authorization", "Bearer "+token)
 			},
 			expectCode: http.StatusForbidden,
 		},
@@ -217,52 +278,37 @@ base64_decode(encoded) = decoded {
 			name: "CorrectTenantIDAllowsAccess",
 			setupReq: func(req *http.Request) {
 				req.URL.Path = "/secure-endpoint"
-				req.Header.Set("Authorization", "Bearer token123")
-				req.Header.Set("X-Tenant-ID", "test-tenant-123")
-				userInfo := createJWT("test-tenant-123")
-				req.Header.Set("x-endpoint-api-userinfo", userInfo)
+				// Set a valid JWT with correct tenant ID
+				token := createJWT("test-tenant-123", "")
+				req.Header.Set("Authorization", "Bearer "+token)
 			},
 			expectCode:       http.StatusOK,
 			checkTenant:      true,
 			expectedTenantID: "test-tenant-123",
 		},
 		{
-			name: "TenantIDsFromJWTAndHostMismatch",
+			name: "FirebaseTenantAllowsAccesss",
 			setupReq: func(req *http.Request) {
 				req.URL.Path = "/secure-endpoint"
-				req.Header.Set("Authorization", "Bearer token123")
-
-				// Set tenant ID in header that matches expected
-				req.Header.Set("X-Tenant-ID", "test-tenant-123")
-
-				// Create JWT with a different tenant ID than the host
-				userInfo := createJWT("tenant123")
-				req.Header.Set("x-endpoint-api-userinfo", userInfo)
-
-				// Set host with a different tenant ID
-				req.Host = "different-tenant.api.example.com"
-			},
-			expectCode: http.StatusForbidden,
-		},
-		{
-			name: "TenantIDsFromJWTAndHostMatch",
-			setupReq: func(req *http.Request) {
-				req.URL.Path = "/secure-endpoint"
-				req.Header.Set("Authorization", "Bearer token123")
-
-				// Set tenant ID in header that matches expected
-				req.Header.Set("X-Tenant-ID", "test-tenant-123")
-
-				// Create JWT with tenant ID matching host
-				userInfo := createJWT("test-tenant-123")
-				req.Header.Set("x-endpoint-api-userinfo", userInfo)
-
-				// Set host with matching tenant
-				req.Host = "test-tenant-123.api.example.com"
+				// Set a valid JWT with firebase tenant
+				token := createJWT("", "test-tenant-123")
+				req.Header.Set("Authorization", "Bearer "+token)
 			},
 			expectCode:       http.StatusOK,
 			checkTenant:      true,
 			expectedTenantID: "test-tenant-123",
+		},
+		{
+			name: "BothTenantFieldsPreferRegular",
+			setupReq: func(req *http.Request) {
+				req.URL.Path = "/secure-endpoint"
+				// Set a valid JWT with both tenant fields
+				token := createJWT("test-tenant-123", "different-tenant")
+				req.Header.Set("Authorization", "Bearer "+token)
+			},
+			expectCode:       http.StatusOK,
+			checkTenant:      true,
+			expectedTenantID: "test-tenant-123", // Should prefer TenantID over Firebase.Tenant
 		},
 	}
 
@@ -295,7 +341,6 @@ base64_decode(encoded) = decoded {
 				Str("host", req.Host).
 				Str("auth", req.Header.Get("Authorization")).
 				Str("tenant", req.Header.Get("X-Tenant-ID")).
-				Str("userinfo", req.Header.Get("x-endpoint-api-userinfo")).
 				Msg("Test request details")
 
 			// Create a response recorder
@@ -330,9 +375,3 @@ base64_decode(encoded) = decoded {
 		})
 	}
 }
-
-type ContextKey string
-
-const (
-	TenantIDKey ContextKey = "tenantID"
-)

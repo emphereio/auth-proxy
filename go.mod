@@ -5,6 +5,7 @@ go 1.23.6
 toolchain go1.23.8
 
 require (
+	github.com/golang-jwt/jwt/v4 v4.5.2
 	github.com/open-policy-agent/opa v1.3.0
 	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.10.0
