@@ -32,6 +32,26 @@ type CustomClaims struct {
 	} `json:"firebase,omitempty"`
 }
 
+// AuthError represents an authentication error
+type AuthError struct {
+	StatusCode int
+	Message    string
+	Err        error
+}
+
+// Error returns the error message
+func (e *AuthError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("%s: %v", e.Message, e.Err)
+	}
+	return e.Message
+}
+
+// Unwrap returns the underlying error
+func (e *AuthError) Unwrap() error {
+	return e.Err
+}
+
 // InitJWTVerification initializes the JWT verification system
 func InitJWTVerification() error {
 	// Fetch public keys immediately on startup
@@ -165,7 +185,7 @@ func VerifyToken(tokenString string) (*CustomClaims, error) {
 }
 
 // ExtractTenantID extracts the tenant ID from the request
-func ExtractTenantID(r *http.Request) string {
+func ExtractTenantID(r *http.Request) (string, *AuthError) {
 	log.Debug().
 		Str("authorization", r.Header.Get("Authorization")).
 		Msg("Extracting tenant ID")
@@ -173,8 +193,10 @@ func ExtractTenantID(r *http.Request) string {
 	// Get the authorization header
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
-		log.Warn().Msg("Authorization header is empty")
-		return ""
+		return "", &AuthError{
+			StatusCode: http.StatusUnauthorized,
+			Message:    "Missing authorization header",
+		}
 	}
 
 	// Extract token from Authorization header
@@ -183,11 +205,38 @@ func ExtractTenantID(r *http.Request) string {
 	// Verify the token
 	claims, err := VerifyToken(token)
 	if err != nil {
+		var errMsg string
+		var statusCode int
+
+		// Check for specific error types and provide clear messages
+		switch {
+		case strings.Contains(err.Error(), "token is expired"):
+			errMsg = "Authentication token has expired"
+			statusCode = http.StatusUnauthorized
+		case strings.Contains(err.Error(), "signature is invalid"):
+			errMsg = "Invalid token signature"
+			statusCode = http.StatusUnauthorized
+		case strings.Contains(err.Error(), "token missing key ID"):
+			errMsg = "Malformed authentication token"
+			statusCode = http.StatusBadRequest
+		case strings.Contains(err.Error(), "key ID not found"):
+			errMsg = "Unknown token issuer"
+			statusCode = http.StatusUnauthorized
+		default:
+			errMsg = "Token verification failed"
+			statusCode = http.StatusUnauthorized
+		}
+
 		log.Error().
 			Err(err).
 			Str("token", token).
 			Msg("Failed to verify token")
-		return ""
+
+		return "", &AuthError{
+			StatusCode: statusCode,
+			Message:    errMsg,
+			Err:        err,
+		}
 	}
 
 	// Check tenantId field first
@@ -196,7 +245,7 @@ func ExtractTenantID(r *http.Request) string {
 			Str("source", "token.tenantId").
 			Str("tenantID", claims.TenantID).
 			Msg("Found tenant ID")
-		return claims.TenantID
+		return claims.TenantID, nil
 	}
 
 	// Try Firebase tenant
@@ -205,9 +254,12 @@ func ExtractTenantID(r *http.Request) string {
 			Str("source", "token.firebase.tenant").
 			Str("tenantID", claims.Firebase.Tenant).
 			Msg("Found tenant ID")
-		return claims.Firebase.Tenant
+		return claims.Firebase.Tenant, nil
 	}
 
 	log.Warn().Msg("No tenant ID found in claims")
-	return ""
+	return "", &AuthError{
+		StatusCode: http.StatusForbidden,
+		Message:    "No tenant ID found in token claims",
+	}
 }

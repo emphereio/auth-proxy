@@ -109,6 +109,31 @@ func setupMockFirebaseServer(t *testing.T) (*httptest.Server, string, *rsa.Priva
 	return server, kid, privateKey
 }
 
+// mockTransport intercepts HTTP requests and redirects them to our test server
+type mockTransport struct {
+	server *httptest.Server
+}
+
+func (m *mockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Only intercept requests to the Firebase public keys URL
+	if req.URL.String() == FirebasePublicKeysURL {
+		// Create a new request to our test server
+		newReq, err := http.NewRequest(req.Method, m.server.URL, req.Body)
+		if err != nil {
+			return nil, err
+		}
+
+		// Copy headers
+		newReq.Header = req.Header
+
+		// Send the request to our test server
+		return m.server.Client().Do(newReq)
+	}
+
+	// For other requests, use the default transport
+	return http.DefaultTransport.RoundTrip(req)
+}
+
 // TestInitJWTVerification tests JWT initialization using a modified package variable
 func TestInitJWTVerification(t *testing.T) {
 	// Setup a mock server for Firebase public keys
@@ -143,31 +168,6 @@ func TestInitJWTVerification(t *testing.T) {
 
 	assert.Equal(t, 1, keyCount, "Should have loaded exactly one public key")
 	assert.True(t, hasKey, "Should have loaded the key with expected ID")
-}
-
-// mockTransport intercepts HTTP requests and redirects them to our test server
-type mockTransport struct {
-	server *httptest.Server
-}
-
-func (m *mockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Only intercept requests to the Firebase public keys URL
-	if req.URL.String() == FirebasePublicKeysURL {
-		// Create a new request to our test server
-		newReq, err := http.NewRequest(req.Method, m.server.URL, req.Body)
-		if err != nil {
-			return nil, err
-		}
-
-		// Copy headers
-		newReq.Header = req.Header
-
-		// Send the request to our test server
-		return m.server.Client().Do(newReq)
-	}
-
-	// For other requests, use the default transport
-	return http.DefaultTransport.RoundTrip(req)
 }
 
 // TestVerifyToken tests the VerifyToken function
@@ -346,10 +346,31 @@ func TestExtractTenantID(t *testing.T) {
 	bothTenantsClaims.Firebase.Tenant = "firebase789"
 	bothTenantsToken := generateTestToken(t, privateKey, kid, bothTenantsClaims)
 
+	expiredClaims := &CustomClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "user123",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(-time.Hour)), // Expired
+			IssuedAt:  jwt.NewNumericDate(time.Now().Add(-2 * time.Hour)),
+		},
+		TenantID: "tenant456",
+	}
+	expiredToken := generateTestToken(t, privateKey, kid, expiredClaims)
+
+	noTenantClaims := &CustomClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "user123",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		},
+	}
+	noTenantToken := generateTestToken(t, privateKey, kid, noTenantClaims)
+
 	testCases := []struct {
-		name             string
-		setupRequest     func() *http.Request
-		expectedTenantID string
+		name               string
+		setupRequest       func() *http.Request
+		expectedTenantID   string
+		expectError        bool
+		expectedStatusCode int
+		expectedErrorMsg   string
 	}{
 		{
 			name: "EmptyAuthHeader",
@@ -357,7 +378,10 @@ func TestExtractTenantID(t *testing.T) {
 				req := httptest.NewRequest("GET", "http://example.com", nil)
 				return req
 			},
-			expectedTenantID: "",
+			expectedTenantID:   "",
+			expectError:        true,
+			expectedStatusCode: http.StatusUnauthorized,
+			expectedErrorMsg:   "Missing authorization header",
 		},
 		{
 			name: "InvalidToken",
@@ -366,7 +390,34 @@ func TestExtractTenantID(t *testing.T) {
 				req.Header.Set("Authorization", "Bearer invalid-token")
 				return req
 			},
-			expectedTenantID: "",
+			expectedTenantID:   "",
+			expectError:        true,
+			expectedStatusCode: http.StatusUnauthorized,
+			expectedErrorMsg:   "Token verification failed",
+		},
+		{
+			name: "ExpiredToken",
+			setupRequest: func() *http.Request {
+				req := httptest.NewRequest("GET", "http://example.com", nil)
+				req.Header.Set("Authorization", "Bearer "+expiredToken)
+				return req
+			},
+			expectedTenantID:   "",
+			expectError:        true,
+			expectedStatusCode: http.StatusUnauthorized,
+			expectedErrorMsg:   "Authentication token has expired",
+		},
+		{
+			name: "NoTenantID",
+			setupRequest: func() *http.Request {
+				req := httptest.NewRequest("GET", "http://example.com", nil)
+				req.Header.Set("Authorization", "Bearer "+noTenantToken)
+				return req
+			},
+			expectedTenantID:   "",
+			expectError:        true,
+			expectedStatusCode: http.StatusForbidden,
+			expectedErrorMsg:   "No tenant ID found in token claims",
 		},
 		{
 			name: "RegularTenantID",
@@ -376,6 +427,7 @@ func TestExtractTenantID(t *testing.T) {
 				return req
 			},
 			expectedTenantID: "tenant456",
+			expectError:      false,
 		},
 		{
 			name: "FirebaseTenant",
@@ -385,6 +437,7 @@ func TestExtractTenantID(t *testing.T) {
 				return req
 			},
 			expectedTenantID: "firebase789",
+			expectError:      false,
 		},
 		{
 			name: "BothTenants_PreferRegular",
@@ -394,14 +447,24 @@ func TestExtractTenantID(t *testing.T) {
 				return req
 			},
 			expectedTenantID: "tenant456", // Should prefer TenantID over Firebase.Tenant
+			expectError:      false,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			req := tc.setupRequest()
-			tenantID := ExtractTenantID(req)
-			assert.Equal(t, tc.expectedTenantID, tenantID)
+			tenantID, authErr := ExtractTenantID(req)
+
+			if tc.expectError {
+				assert.NotNil(t, authErr)
+				assert.Equal(t, tc.expectedStatusCode, authErr.StatusCode)
+				assert.Equal(t, tc.expectedErrorMsg, authErr.Message)
+				assert.Equal(t, "", tenantID)
+			} else {
+				assert.Nil(t, authErr)
+				assert.Equal(t, tc.expectedTenantID, tenantID)
+			}
 		})
 	}
 }

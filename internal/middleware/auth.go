@@ -1,4 +1,3 @@
-// Package middleware provides HTTP middleware components
 package middleware
 
 import (
@@ -47,10 +46,14 @@ func Auth(opaEngine *opa.Engine, cfg *config.Config) func(http.Handler) http.Han
 			}
 
 			// Extract tenant ID
-			tenantID := jwt.ExtractTenantID(r)
-			if tenantID == "" {
-				log.Debug().Str("path", r.URL.Path).Msg("Unable to determine tenant ID")
-				respondWithError(w, http.StatusForbidden, "Unable to determine tenant ID")
+			tenantID, authErr := jwt.ExtractTenantID(r)
+			if authErr != nil {
+				log.Debug().
+					Str("path", r.URL.Path).
+					Str("error", authErr.Error()).
+					Int("status", authErr.StatusCode).
+					Msg("Authentication failed")
+				respondWithError(w, authErr.StatusCode, authErr.Message)
 				return
 			}
 

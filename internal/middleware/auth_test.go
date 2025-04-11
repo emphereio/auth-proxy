@@ -257,10 +257,47 @@ allow {
 			expectCode: http.StatusUnauthorized,
 		},
 		{
-			name: "MissingTenantIDReturns403",
+			name: "InvalidTokenReturns401",
 			setupReq: func(req *http.Request) {
 				req.URL.Path = "/secure-endpoint"
 				req.Header.Set("Authorization", "Bearer invalid-token")
+			},
+			expectCode: http.StatusUnauthorized,
+		},
+		{
+			name: "ExpiredTokenReturns401",
+			setupReq: func(req *http.Request) {
+				req.URL.Path = "/secure-endpoint"
+
+				// Create an expired token
+				expiredClaims := &jwt.CustomClaims{
+					RegisteredClaims: jwtlib.RegisteredClaims{
+						Subject:   "user123",
+						ExpiresAt: jwtlib.NewNumericDate(time.Now().Add(-time.Hour)), // Expired
+						IssuedAt:  jwtlib.NewNumericDate(time.Now().Add(-2 * time.Hour)),
+					},
+					TenantID: "test-tenant-123",
+				}
+				expiredToken := generateTestToken(t, privateKey, kid, expiredClaims)
+				req.Header.Set("Authorization", "Bearer "+expiredToken)
+			},
+			expectCode: http.StatusUnauthorized,
+		},
+		{
+			name: "NoTenantIDReturns403",
+			setupReq: func(req *http.Request) {
+				req.URL.Path = "/secure-endpoint"
+
+				// Token with no tenant ID
+				noTenantClaims := &jwt.CustomClaims{
+					RegisteredClaims: jwtlib.RegisteredClaims{
+						Subject:   "user123",
+						ExpiresAt: jwtlib.NewNumericDate(time.Now().Add(time.Hour)),
+						IssuedAt:  jwtlib.NewNumericDate(time.Now()),
+					},
+				}
+				noTenantToken := generateTestToken(t, privateKey, kid, noTenantClaims)
+				req.Header.Set("Authorization", "Bearer "+noTenantToken)
 			},
 			expectCode: http.StatusForbidden,
 		},
@@ -287,7 +324,7 @@ allow {
 			expectedTenantID: "test-tenant-123",
 		},
 		{
-			name: "FirebaseTenantAllowsAccesss",
+			name: "FirebaseTenantAllowsAccess",
 			setupReq: func(req *http.Request) {
 				req.URL.Path = "/secure-endpoint"
 				// Set a valid JWT with firebase tenant

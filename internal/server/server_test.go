@@ -425,6 +425,20 @@ func TestMiddlewareChain(t *testing.T) {
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
 	})
 
+	// Test missing auth header
+	t.Run("MissingAuthHeaderReturns401", func(t *testing.T) {
+		req, err := http.NewRequest("GET", baseURL+"/secure-endpoint", nil)
+		require.NoError(t, err)
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		// Should be unauthorized because no auth header
+		assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	})
+
 	// Test auth denied with invalid token
 	t.Run("AuthDeniedWithInvalidToken", func(t *testing.T) {
 		req, err := http.NewRequest("GET", baseURL+"/secure-endpoint", nil)
@@ -438,8 +452,8 @@ func TestMiddlewareChain(t *testing.T) {
 		require.NoError(t, err)
 		defer resp.Body.Close()
 
-		// Should be forbidden because token is invalid
-		assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+		// Should be unauthorized (401) because token is invalid
+		assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	})
 
 	// Test auth denied with wrong tenant in token
@@ -465,6 +479,7 @@ func TestMiddlewareChain(t *testing.T) {
 		require.NoError(t, err)
 		defer resp.Body.Close()
 
+		// Should be forbidden (403) because tenant ID doesn't match expected
 		assert.Equal(t, http.StatusForbidden, resp.StatusCode)
 	})
 
@@ -489,6 +504,60 @@ func TestMiddlewareChain(t *testing.T) {
 		// The important part is that it passed auth middleware and attempted to proxy to the backend
 		assert.True(t, resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable,
 			"Expected either 502 Bad Gateway or 503 Service Unavailable status code when backend is unavailable, got %d", resp.StatusCode)
+	})
+
+	// Test token without tenant ID
+	t.Run("NoTenantIDReturns403", func(t *testing.T) {
+		noTenantClaims := &jwt.CustomClaims{
+			RegisteredClaims: jwtlib.RegisteredClaims{
+				Subject:   "user123",
+				ExpiresAt: jwtlib.NewNumericDate(time.Now().Add(time.Hour)),
+				IssuedAt:  jwtlib.NewNumericDate(time.Now()),
+			},
+			// No tenant ID
+		}
+		noTenantToken := generateTestToken(t, privateKey, kid, noTenantClaims)
+
+		req, err := http.NewRequest("GET", baseURL+"/secure-endpoint", nil)
+		require.NoError(t, err)
+
+		// Set authorization header with token that has no tenant ID
+		req.Header.Set("Authorization", "Bearer "+noTenantToken)
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		// Should be forbidden (403) because token has no tenant ID
+		assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	})
+
+	// Test expired token
+	t.Run("ExpiredTokenReturns401", func(t *testing.T) {
+		expiredClaims := &jwt.CustomClaims{
+			RegisteredClaims: jwtlib.RegisteredClaims{
+				Subject:   "user123",
+				ExpiresAt: jwtlib.NewNumericDate(time.Now().Add(-time.Hour)), // Expired
+				IssuedAt:  jwtlib.NewNumericDate(time.Now().Add(-2 * time.Hour)),
+			},
+			TenantID: expectedTenantID,
+		}
+		expiredToken := generateTestToken(t, privateKey, kid, expiredClaims)
+
+		req, err := http.NewRequest("GET", baseURL+"/secure-endpoint", nil)
+		require.NoError(t, err)
+
+		// Set authorization header with expired token
+		req.Header.Set("Authorization", "Bearer "+expiredToken)
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		// Should be unauthorized (401) because token is expired
+		assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	})
 
 	// Test CORS preflight handling
