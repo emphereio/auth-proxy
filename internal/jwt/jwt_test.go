@@ -1,15 +1,55 @@
-package jwt_test
+package jwt
 
 import (
-	"encoding/base64"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
-	"github.com/emphereio/auth-proxy/internal/jwt"
+	"github.com/golang-jwt/jwt/v4"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+// Test helper function to generate a fake RSA key pair
+func generateTestRSAKey() (*rsa.PrivateKey, string, error) {
+	// Generate a new RSA key pair
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Create PEM block for the public key
+	publicKeyDer, err := x509.MarshalPKIXPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		return nil, "", err
+	}
+
+	publicKeyBlock := &pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: publicKeyDer,
+	}
+	publicKeyPem := string(pem.EncodeToMemory(publicKeyBlock))
+
+	return privateKey, publicKeyPem, nil
+}
+
+// Test helper to generate a signed JWT token for testing
+func generateTestToken(t *testing.T, privateKey *rsa.PrivateKey, kid string, claims *CustomClaims) string {
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	token.Header["kid"] = kid
+
+	// Sign the token with the private key
+	tokenString, err := token.SignedString(privateKey)
+	require.NoError(t, err, "Failed to sign test token")
+	return tokenString
+}
 
 func TestExtractTokenFromHeader(t *testing.T) {
 	testCases := []struct {
@@ -36,229 +76,489 @@ func TestExtractTokenFromHeader(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			token := jwt.ExtractTokenFromHeader(tc.authHeader)
+			token := ExtractTokenFromHeader(tc.authHeader)
 			assert.Equal(t, tc.expectedToken, token)
 		})
 	}
 }
 
-func TestDecodePayload(t *testing.T) {
-	// Create a valid payload with tenantId
-	payload := jwt.Payload{
-		Subject:  "user123",
-		TenantID: "tenant456",
-		Role:     "admin",
+// For tests that need to mock the Firebase public keys endpoint
+func setupMockFirebaseServer(t *testing.T) (*httptest.Server, string, *rsa.PrivateKey) {
+	// Generate a test RSA key pair
+	privateKey, publicKeyPem, err := generateTestRSAKey()
+	require.NoError(t, err, "Failed to generate test RSA key")
+
+	// Create a mock key ID
+	kid := "test-key-id-1"
+
+	// Setup a mock server that returns our test public key
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Create a response similar to Firebase's format
+		keys := map[string]string{
+			kid: publicKeyPem,
+		}
+
+		// Set cache-control header to test expiry handling
+		w.Header().Set("Cache-Control", "public, max-age=21600")
+		w.Header().Set("Content-Type", "application/json")
+
+		// Write the response
+		json.NewEncoder(w).Encode(keys)
+	}))
+
+	return server, kid, privateKey
+}
+
+// mockTransport intercepts HTTP requests and redirects them to our test server
+type mockTransport struct {
+	server *httptest.Server
+}
+
+func (m *mockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Only intercept requests to the Firebase public keys URL
+	if req.URL.String() == FirebasePublicKeysURL {
+		// Create a new request to our test server
+		newReq, err := http.NewRequest(req.Method, m.server.URL, req.Body)
+		if err != nil {
+			return nil, err
+		}
+
+		// Copy headers
+		newReq.Header = req.Header
+
+		// Send the request to our test server
+		return m.server.Client().Do(newReq)
 	}
-	payloadJSON, _ := json.Marshal(payload)
 
-	// Standard base64 encode the payload
-	encodedPayload := base64.StdEncoding.EncodeToString(payloadJSON)
-	// Create a mock JWT with the payload (use a dummy header and signature)
-	tokenWithStdEncoding := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." + encodedPayload + ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+	// For other requests, use the default transport
+	return http.DefaultTransport.RoundTrip(req)
+}
 
-	// URL-safe base64 encode the payload
-	encodedPayloadURL := base64.URLEncoding.EncodeToString(payloadJSON)
-	// Create a mock JWT with the URL-safe payload
-	tokenWithURLEncoding := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." + encodedPayloadURL + ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+// TestInitJWTVerification tests JWT initialization using a modified package variable
+func TestInitJWTVerification(t *testing.T) {
+	// Setup a mock server for Firebase public keys
+	server, kid, _ := setupMockFirebaseServer(t)
+	defer server.Close()
 
-	// Raw URL-safe base64 encode the payload (without padding)
-	encodedPayloadRawURL := base64.RawURLEncoding.EncodeToString(payloadJSON)
-	// Create a mock JWT with the Raw URL-safe payload
-	tokenWithRawURLEncoding := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." + encodedPayloadRawURL + ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+	// Save original HTTP client and restore after test
+	originalClient := http.DefaultClient
+	defer func() { http.DefaultClient = originalClient }()
 
+	// Create a custom client that redirects to our test server
+	http.DefaultClient = &http.Client{
+		Transport: &mockTransport{
+			server: server,
+		},
+	}
+
+	// Clear any existing keys
+	publicKeysMutex.Lock()
+	publicKeys = make(map[string]interface{})
+	publicKeysMutex.Unlock()
+
+	// Call the initialization function
+	err := InitJWTVerification()
+	assert.NoError(t, err, "InitJWTVerification should not return an error")
+
+	// Verify that we've loaded keys
+	publicKeysMutex.RLock()
+	keyCount := len(publicKeys)
+	hasKey := publicKeys[kid] != nil
+	publicKeysMutex.RUnlock()
+
+	assert.Equal(t, 1, keyCount, "Should have loaded exactly one public key")
+	assert.True(t, hasKey, "Should have loaded the key with expected ID")
+}
+
+// TestVerifyToken tests the VerifyToken function
+func TestVerifyToken(t *testing.T) {
+	// Setup a mock server
+	server, kid, privateKey := setupMockFirebaseServer(t)
+	defer server.Close()
+
+	// Save original HTTP client and restore after test
+	originalClient := http.DefaultClient
+	defer func() { http.DefaultClient = originalClient }()
+
+	// Create a custom client that redirects to our test server
+	http.DefaultClient = &http.Client{
+		Transport: &mockTransport{
+			server: server,
+		},
+	}
+
+	// Initialize JWT verification to load our mock keys
+	err := InitJWTVerification()
+	require.NoError(t, err, "Failed to initialize JWT verification")
+
+	// Create a valid token
+	validClaims := &CustomClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "user123",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+		TenantID: "tenant456",
+	}
+	validToken := generateTestToken(t, privateKey, kid, validClaims)
+
+	// Create an expired token
+	expiredClaims := &CustomClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "user123",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(-time.Hour)), // Expired
+			IssuedAt:  jwt.NewNumericDate(time.Now().Add(-2 * time.Hour)),
+		},
+		TenantID: "tenant456",
+	}
+	expiredToken := generateTestToken(t, privateKey, kid, expiredClaims)
+
+	// Create a token with firebase tenant info
+	firebaseTenantClaims := &CustomClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "user123",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+	}
+	firebaseTenantClaims.Firebase.Tenant = "firebase789"
+	firebaseTenantToken := generateTestToken(t, privateKey, kid, firebaseTenantClaims)
+
+	// Create a token with unknown key ID
+	unknownKidToken := generateTestToken(t, privateKey, "unknown-kid", validClaims)
+
+	// Test cases
 	testCases := []struct {
-		name            string
-		token           string
-		expectedError   bool
-		expectedPayload *jwt.Payload
+		name        string
+		token       string
+		expectError bool
+		checkClaims func(t *testing.T, claims *CustomClaims)
 	}{
 		{
-			name:          "ValidTokenWithStdEncoding",
-			token:         tokenWithStdEncoding,
-			expectedError: false,
-			expectedPayload: &jwt.Payload{
-				Subject:  "user123",
-				TenantID: "tenant456",
-				Role:     "admin",
+			name:        "ValidToken",
+			token:       validToken,
+			expectError: false,
+			checkClaims: func(t *testing.T, claims *CustomClaims) {
+				assert.Equal(t, "user123", claims.Subject)
+				assert.Equal(t, "tenant456", claims.TenantID)
 			},
 		},
 		{
-			name:          "ValidTokenWithURLEncoding",
-			token:         tokenWithURLEncoding,
-			expectedError: false,
-			expectedPayload: &jwt.Payload{
-				Subject:  "user123",
-				TenantID: "tenant456",
-				Role:     "admin",
+			name:        "ExpiredToken",
+			token:       expiredToken,
+			expectError: true,
+			checkClaims: nil,
+		},
+		{
+			name:        "FirebaseTenantToken",
+			token:       firebaseTenantToken,
+			expectError: false,
+			checkClaims: func(t *testing.T, claims *CustomClaims) {
+				assert.Equal(t, "user123", claims.Subject)
+				assert.Equal(t, "firebase789", claims.Firebase.Tenant)
 			},
 		},
 		{
-			name:          "ValidTokenWithRawURLEncoding",
-			token:         tokenWithRawURLEncoding,
-			expectedError: false,
-			expectedPayload: &jwt.Payload{
-				Subject:  "user123",
-				TenantID: "tenant456",
-				Role:     "admin",
-			},
+			name:        "EmptyToken",
+			token:       "",
+			expectError: true,
+			checkClaims: nil,
 		},
 		{
-			name:          "TokenWithBearerPrefix",
-			token:         "Bearer " + tokenWithStdEncoding,
-			expectedError: false,
-			expectedPayload: &jwt.Payload{
-				Subject:  "user123",
-				TenantID: "tenant456",
-				Role:     "admin",
-			},
+			name:        "InvalidToken",
+			token:       "not.a.valid.token",
+			expectError: true,
+			checkClaims: nil,
 		},
 		{
-			name:            "InvalidTokenFormat",
-			token:           "not.a.valid.token",
-			expectedError:   true,
-			expectedPayload: nil,
-		},
-		{
-			name:            "EmptyToken",
-			token:           "",
-			expectedError:   true,
-			expectedPayload: nil,
+			name:        "UnknownKidToken",
+			token:       unknownKidToken,
+			expectError: true,
+			checkClaims: nil,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			payload, err := jwt.DecodePayload(tc.token)
+			claims, err := VerifyToken(tc.token)
 
-			if tc.expectedError {
+			if tc.expectError {
 				assert.Error(t, err)
-				assert.Nil(t, payload)
+				assert.Nil(t, claims)
 			} else {
 				assert.NoError(t, err)
-				assert.Equal(t, tc.expectedPayload.Subject, payload.Subject)
-				assert.Equal(t, tc.expectedPayload.TenantID, payload.TenantID)
-				assert.Equal(t, tc.expectedPayload.Role, payload.Role)
+				assert.NotNil(t, claims)
+				if tc.checkClaims != nil {
+					tc.checkClaims(t, claims)
+				}
 			}
 		})
 	}
 }
 
+// TestExtractTenantID tests the ExtractTenantID function
 func TestExtractTenantID(t *testing.T) {
-	// Create a valid payload with tenantId
-	createToken := func(tenantID string, firebaseTenant string) string {
-		// Create payload
-		payload := jwt.Payload{
-			TenantID: tenantID,
-		}
-		if firebaseTenant != "" {
-			payload.Firebase.Tenant = firebaseTenant
-		}
+	// Setup a mock server
+	server, kid, privateKey := setupMockFirebaseServer(t)
+	defer server.Close()
 
-		payloadJSON, _ := json.Marshal(payload)
-		encodedPayload := base64.StdEncoding.EncodeToString(payloadJSON)
+	// Save original HTTP client and restore after test
+	originalClient := http.DefaultClient
+	defer func() { http.DefaultClient = originalClient }()
 
-		// Create a proper JWT token format (header.payload.signature)
-		// Using a dummy header and signature
-		return "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." + encodedPayload + ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+	// Create a custom client that redirects to our test server
+	http.DefaultClient = &http.Client{
+		Transport: &mockTransport{
+			server: server,
+		},
 	}
 
+	// Initialize JWT verification to load our mock keys
+	err := InitJWTVerification()
+	require.NoError(t, err, "Failed to initialize JWT verification")
+
+	// Create tokens with different tenant configurations
+	regularTenantClaims := &CustomClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "user123",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		},
+		TenantID: "tenant456",
+	}
+	regularTenantToken := generateTestToken(t, privateKey, kid, regularTenantClaims)
+
+	firebaseTenantClaims := &CustomClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "user123",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		},
+	}
+	firebaseTenantClaims.Firebase.Tenant = "firebase789"
+	firebaseTenantToken := generateTestToken(t, privateKey, kid, firebaseTenantClaims)
+
+	bothTenantsClaims := &CustomClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "user123",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		},
+		TenantID: "tenant456",
+	}
+	bothTenantsClaims.Firebase.Tenant = "firebase789"
+	bothTenantsToken := generateTestToken(t, privateKey, kid, bothTenantsClaims)
+
+	expiredClaims := &CustomClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "user123",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(-time.Hour)), // Expired
+			IssuedAt:  jwt.NewNumericDate(time.Now().Add(-2 * time.Hour)),
+		},
+		TenantID: "tenant456",
+	}
+	expiredToken := generateTestToken(t, privateKey, kid, expiredClaims)
+
+	noTenantClaims := &CustomClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "user123",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		},
+	}
+	noTenantToken := generateTestToken(t, privateKey, kid, noTenantClaims)
+
 	testCases := []struct {
-		name             string
-		setupRequest     func() *http.Request
-		expectedTenantID string
+		name               string
+		setupRequest       func() *http.Request
+		expectedTenantID   string
+		expectError        bool
+		expectedStatusCode int
+		expectedErrorMsg   string
 	}{
 		{
-			name: "FromUserInfoHeader",
+			name: "EmptyAuthHeader",
 			setupRequest: func() *http.Request {
 				req := httptest.NewRequest("GET", "http://example.com", nil)
-				req.Header.Set("x-endpoint-api-userinfo", createToken("tenant123", ""))
 				return req
 			},
-			expectedTenantID: "tenant123",
+			expectedTenantID:   "",
+			expectError:        true,
+			expectedStatusCode: http.StatusUnauthorized,
+			expectedErrorMsg:   "Missing authorization header",
 		},
 		{
-			name: "FromFirebaseTenant",
+			name: "InvalidToken",
 			setupRequest: func() *http.Request {
 				req := httptest.NewRequest("GET", "http://example.com", nil)
-				req.Header.Set("x-endpoint-api-userinfo", createToken("", "firebase789"))
+				req.Header.Set("Authorization", "Bearer invalid-token")
+				return req
+			},
+			expectedTenantID:   "",
+			expectError:        true,
+			expectedStatusCode: http.StatusUnauthorized,
+			expectedErrorMsg:   "Token verification failed",
+		},
+		{
+			name: "ExpiredToken",
+			setupRequest: func() *http.Request {
+				req := httptest.NewRequest("GET", "http://example.com", nil)
+				req.Header.Set("Authorization", "Bearer "+expiredToken)
+				return req
+			},
+			expectedTenantID:   "",
+			expectError:        true,
+			expectedStatusCode: http.StatusUnauthorized,
+			expectedErrorMsg:   "Authentication token has expired",
+		},
+		{
+			name: "NoTenantID",
+			setupRequest: func() *http.Request {
+				req := httptest.NewRequest("GET", "http://example.com", nil)
+				req.Header.Set("Authorization", "Bearer "+noTenantToken)
+				return req
+			},
+			expectedTenantID:   "",
+			expectError:        true,
+			expectedStatusCode: http.StatusForbidden,
+			expectedErrorMsg:   "No tenant ID found in token claims",
+		},
+		{
+			name: "RegularTenantID",
+			setupRequest: func() *http.Request {
+				req := httptest.NewRequest("GET", "http://example.com", nil)
+				req.Header.Set("Authorization", "Bearer "+regularTenantToken)
+				return req
+			},
+			expectedTenantID: "tenant456",
+			expectError:      false,
+		},
+		{
+			name: "FirebaseTenant",
+			setupRequest: func() *http.Request {
+				req := httptest.NewRequest("GET", "http://example.com", nil)
+				req.Header.Set("Authorization", "Bearer "+firebaseTenantToken)
 				return req
 			},
 			expectedTenantID: "firebase789",
+			expectError:      false,
 		},
 		{
-			name: "FromTenantHeader",
+			name: "BothTenants_PreferRegular",
 			setupRequest: func() *http.Request {
 				req := httptest.NewRequest("GET", "http://example.com", nil)
-				req.Header.Set("X-Tenant-ID", "header456")
+				req.Header.Set("Authorization", "Bearer "+bothTenantsToken)
 				return req
 			},
-			expectedTenantID: "header456",
-		},
-		{
-			name: "PrecedenceOrder",
-			setupRequest: func() *http.Request {
-				req := httptest.NewRequest("GET", "http://example.com", nil)
-				req.Header.Set("x-endpoint-api-userinfo", createToken("userinfo555", ""))
-				req.Header.Set("X-Tenant-ID", "header999")
-				return req
-			},
-			expectedTenantID: "userinfo555", // Should prefer userinfo over header
-		},
-		{
-			name: "NoTenantInfo",
-			setupRequest: func() *http.Request {
-				return httptest.NewRequest("GET", "http://example.com", nil)
-			},
-			expectedTenantID: "",
+			expectedTenantID: "tenant456", // Should prefer TenantID over Firebase.Tenant
+			expectError:      false,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			req := tc.setupRequest()
-			tenantID := jwt.ExtractTenantID(req)
-			assert.Equal(t, tc.expectedTenantID, tenantID)
+			tenantID, authErr := ExtractTenantID(req)
+
+			if tc.expectError {
+				assert.NotNil(t, authErr)
+				assert.Equal(t, tc.expectedStatusCode, authErr.StatusCode)
+				assert.Equal(t, tc.expectedErrorMsg, authErr.Message)
+				assert.Equal(t, "", tenantID)
+			} else {
+				assert.Nil(t, authErr)
+				assert.Equal(t, tc.expectedTenantID, tenantID)
+			}
 		})
 	}
 }
 
-func TestExtractTenantIDFromHost(t *testing.T) {
-	testCases := []struct {
-		name             string
-		host             string
-		expectedTenantID string
-	}{
-		{
-			name:             "ValidSubdomain",
-			host:             "tenant123.api.example.com",
-			expectedTenantID: "tenant123",
-		},
-		{
-			name:             "NoSubdomain",
-			host:             "example.com",
-			expectedTenantID: "",
-		},
-		{
-			name:             "EmptyHost",
-			host:             "",
-			expectedTenantID: "",
-		},
-		{
-			name:             "MultipleSubdomains",
-			host:             "stage.tenant456.api.example.com",
-			expectedTenantID: "stage", // Takes first part
-		},
-		{
-			name:             "LocalhostWithPort",
-			host:             "localhost:8080",
-			expectedTenantID: "",
+// TestPublicKeyRefresh tests the key refresh functionality
+func TestPublicKeyRefresh(t *testing.T) {
+	// We'll set up two different servers for the two different sets of keys
+	var keyRotationMutex sync.Mutex
+	keyRotation := 0
+
+	// Generate two different key pairs
+	privateKey1, publicKeyPem1, err := generateTestRSAKey()
+	require.NoError(t, err, "Failed to generate first test key")
+
+	_, publicKeyPem2, err := generateTestRSAKey()
+	require.NoError(t, err, "Failed to generate second test key")
+
+	// Setup a mock server that returns different keys on subsequent calls
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		keyRotationMutex.Lock()
+		currentRotation := keyRotation
+		keyRotation++
+		keyRotationMutex.Unlock()
+
+		var keys map[string]string
+
+		// First call returns the first key
+		if currentRotation == 0 {
+			keys = map[string]string{
+				"key-id-1": publicKeyPem1,
+			}
+		} else {
+			// Subsequent calls return a different key
+			keys = map[string]string{
+				"key-id-2": publicKeyPem2,
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "public, max-age=21600")
+		json.NewEncoder(w).Encode(keys)
+	}))
+	defer server.Close()
+
+	// Save original HTTP client and restore after test
+	originalClient := http.DefaultClient
+	defer func() { http.DefaultClient = originalClient }()
+
+	// Create a custom client that redirects to our test server
+	http.DefaultClient = &http.Client{
+		Transport: &mockTransport{
+			server: server,
 		},
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			tenantID := jwt.ExtractTenantIDFromHost(tc.host)
-			assert.Equal(t, tc.expectedTenantID, tenantID)
-		})
+	// Initialize JWT verification with the first key
+	err = InitJWTVerification()
+	require.NoError(t, err, "Failed to initialize JWT verification")
+
+	// Capture the initial state
+	publicKeysMutex.RLock()
+	initialKeys := make(map[string]bool)
+	for kid := range publicKeys {
+		initialKeys[kid] = true
 	}
+	publicKeysMutex.RUnlock()
+
+	// Force a key refresh to get the second key
+	err = fetchFirebasePublicKeys()
+	assert.NoError(t, err, "Key refresh should not fail")
+
+	// Verify keys have changed
+	publicKeysMutex.RLock()
+	newKeys := make(map[string]bool)
+	for kid := range publicKeys {
+		newKeys[kid] = true
+	}
+	publicKeysMutex.RUnlock()
+
+	// Check that the keys have actually changed
+	assert.NotEqual(t, initialKeys, newKeys, "Keys should have changed after refresh")
+	assert.Equal(t, 2, keyRotation, "Server should have been called twice")
+
+	// Create a valid token with the first key to verify it's still working
+	validClaims := &CustomClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "user123",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		},
+	}
+
+	// This token uses key-id-1, which should no longer be in the keys after refresh
+	// So verification should fail
+	tokenWithOldKey := generateTestToken(t, privateKey1, "key-id-1", validClaims)
+	_, err = VerifyToken(tokenWithOldKey)
+	assert.Error(t, err, "Token with old key should fail verification after key rotation")
 }

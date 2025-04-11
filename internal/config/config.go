@@ -15,7 +15,7 @@ const (
 	defaultPort            = "8080"
 	defaultBackendHost     = "localhost"
 	defaultBackendPort     = "8000"
-	defaultPolicyDir       = "/policies"
+	defaultPolicyDir       = "../policies"
 	defaultRequestTimeout  = 10
 	defaultShutdownTimeout = 10
 )

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"github.com/emphereio/auth-proxy/internal/jwt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -29,6 +30,11 @@ func main() {
 		Str("backend", cfg.BackendHost+":"+cfg.BackendPort).
 		Str("policyDir", cfg.PolicyDir).
 		Msg("Starting auth proxy with embedded OPA")
+
+	// Initialize JWT verification
+	if err := jwt.InitJWTVerification(); err != nil {
+		log.Fatal().Err(err).Msg("Failed to initialize JWT verification")
+	}
 
 	// Initialize OPA engine
 	opaEngine, err := opa.NewEngine(cfg.PolicyDir)
