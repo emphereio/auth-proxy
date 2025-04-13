@@ -1,5 +1,3 @@
-I'll update the open-source version of the README.md to include information about the API key functionality while preserving all existing content.
-
 # Auth Proxy with Embedded OPA
 
 A Go-based authorization proxy with embedded Open Policy Agent (OPA) for tenant isolation in multi-tenant applications. This proxy securely verifies JWT tokens and enforces tenant-based access controls.
