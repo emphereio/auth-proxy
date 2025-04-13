@@ -1,3 +1,5 @@
+I'll update the open-source version of the README.md to include information about the API key functionality while preserving all existing content.
+
 # Auth Proxy with Embedded OPA
 
 A Go-based authorization proxy with embedded Open Policy Agent (OPA) for tenant isolation in multi-tenant applications. This proxy securely verifies JWT tokens and enforces tenant-based access controls.
@@ -6,6 +8,7 @@ A Go-based authorization proxy with embedded Open Policy Agent (OPA) for tenant 
 
 - **JWT Token Verification**: Cryptographically verifies JWT signatures from Firebase Auth or other providers
 - **Tenant Authorization**: Enforces tenant isolation using embedded OPA policies
+- **API Key Management**: Server-side API key injection for secure API access
 - **Policy Management**: Dynamically loads, watches, and updates OPA policies
 - **Metrics Collection**: Provides HTTP request and performance metrics
 - **Structured Logging**: Configurable logging with various formats and levels
@@ -23,6 +26,7 @@ flowchart LR
     ESP --> BE[Backend Service]
     Policies[(OPA Policies)] --> AP
     Keys[(JWT Public Keys)] --> AP
+    APIKeys[(API Keys)] --> AP
     ServiceAccount[(Service Account)] --> ESP
 ```
 
@@ -39,10 +43,11 @@ sequenceDiagram
     AP->>AP: Verify JWT signature
     AP->>AP: Extract tenant ID
     AP->>AP: Apply OPA policies
+    AP->>AP: Inject API key (if configured)
     
     alt Authorization Successful
-        AP->>ESP: Forward request
-        ESP->>ESP: Handle transcoding
+        AP->>ESP: Forward request with API key
+        ESP->>ESP: Handle transcoding & API key validation
         ESP->>BE: Forward to backend
         BE->>ESP: Response
         ESP->>AP: Response
@@ -88,6 +93,8 @@ export TENANT_ID=your-tenant-id
 export POLICY_DIR=./policies
 export LOG_LEVEL=DEBUG
 export LOG_FORMAT=console
+export API_KEY_MANAGER_TYPE=env
+export API_KEY_YOUR_TENANT_ID=your-api-key
 ./auth-proxy
 ```
 
@@ -106,6 +113,46 @@ export LOG_FORMAT=console
 | LOG_FORMAT | Log format (json, console) | json |
 | ENVIRONMENT | Runtime environment (development, production) | production |
 | POLICY_REFRESH_INTERVAL | Interval to check for policy updates (seconds) | 30 |
+| API_KEY_MANAGER_TYPE | API key management strategy (env, static, default, chain, none) | none |
+| API_KEY_{TENANT_ID} | API key for specific tenant (when using env type) | |
+| DEFAULT_API_KEY | Default API key (when using default type) | |
+
+## API Key Management
+
+The auth proxy can automatically inject API keys into requests before forwarding them to ESP. This provides enhanced security by keeping API keys server-side instead of requiring clients to manage them.
+
+### API Key Management Strategies
+
+The proxy supports multiple API key management strategies:
+
+1. **Environment Variables (env)**: API keys are loaded from environment variables following the pattern `API_KEY_{TENANT_ID}`.
+2. **Static Mapping (static)**: API keys are defined in a static map within the code or configuration.
+3. **Default Key (default)**: A single default API key is used for all tenants.
+4. **Chained (chain)**: Multiple strategies are tried in sequence.
+5. **None (none)**: API key injection is disabled.
+
+### Flow with API Keys
+
+1. Client authenticates and gets a JWT token
+2. Client includes only the JWT token in its requests (no API key required)
+3. Auth proxy validates the JWT and extracts the tenant ID
+4. Auth proxy injects the appropriate API key for that tenant
+5. ESP validates the API key before forwarding to backend
+
+### Configuration
+
+To enable API key injection, set the following:
+
+```yaml
+env:
+  - name: API_KEY_MANAGER_TYPE
+    value: "env"  # Options: env, static, default, chain, none
+  - name: API_KEY_TENANT1  # Replace TENANT1 with your tenant ID in uppercase
+    value: "your-api-key-for-tenant1"
+  # Or for default key strategy
+  - name: DEFAULT_API_KEY
+    value: "your-default-api-key"
+```
 
 ## Policy Configuration
 
@@ -200,6 +247,13 @@ spec:
               value: "INFO"
             - name: POLICY_DIR
               value: "/policies"
+            - name: API_KEY_MANAGER_TYPE
+              value: "env"
+            - name: API_KEY_TENANT_NAME  # Must match TENANT_ID in uppercase
+              valueFrom:
+                secretKeyRef:
+                  name: api-keys
+                  key: tenant-name-api-key
           ports:
             - containerPort: 8080  # Entry point
           volumeMounts:
@@ -378,6 +432,7 @@ auth-proxy/
 ├── cmd/
 │   └── main.go                  # Application entry point
 ├── internal/
+│   ├── apikey/                  # API key management
 │   ├── config/                  # Configuration
 │   ├── jwt/                     # JWT verification
 │   ├── middleware/              # HTTP middleware components
