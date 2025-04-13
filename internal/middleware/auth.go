@@ -124,7 +124,7 @@ func shouldSkipAuth(path string) bool {
 func handlePreflight(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Tenant-ID")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Tenant-ID, x-api-key")
 	w.Header().Set("Access-Control-Max-Age", "3600")
 	w.WriteHeader(http.StatusOK)
 }
@@ -173,4 +173,13 @@ func createOPAInput(r *http.Request, authHeader, tenantID, expectedTenantID stri
 func GetTenantID(r *http.Request) (string, bool) {
 	tenantID, ok := r.Context().Value(tenantIDKey).(string)
 	return tenantID, ok
+}
+
+// GetTenantIDFromHeader retrieves the tenant ID from the request header
+func GetTenantIDFromHeader(r *http.Request) (string, bool) {
+	tenantID := r.Header.Get("X-Tenant-ID")
+	if tenantID == "" {
+		return "", false
+	}
+	return tenantID, true
 }

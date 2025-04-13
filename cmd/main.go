@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"github.com/emphereio/auth-proxy/internal/apikey"
 	"github.com/emphereio/auth-proxy/internal/jwt"
 	"os"
 	"os/signal"
@@ -50,8 +51,11 @@ func main() {
 	go watcher.Start()
 	defer watcher.Stop()
 
+	// Create key manager for the environment
+	keyManager := apikey.NewEnvKeyManager()
+
 	// Create reverse proxy
-	reverseProxy, err := proxy.NewReverseProxy(cfg)
+	reverseProxy, err := proxy.NewReverseProxy(cfg, keyManager)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to create reverse proxy")
 	}

@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"github.com/emphereio/auth-proxy/internal/apikey"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -104,8 +105,13 @@ func TestServerStart(t *testing.T) {
 	engine, err := opa.NewEngine(tmpDir)
 	require.NoError(t, err)
 
+	// Create a simple key manager for testing
+	keyManager := apikey.NewStaticKeyManager(map[string]string{
+		"test-tenant": "test-api-key",
+	})
+
 	// Create reverse proxy
-	reverseProxy, err := proxy.NewReverseProxy(cfg)
+	reverseProxy, err := proxy.NewReverseProxy(cfg, keyManager)
 	require.NoError(t, err)
 
 	// Create server
@@ -153,8 +159,13 @@ func TestHealthCheckEndpoint(t *testing.T) {
 	engine, err := opa.NewEngine(tmpDir)
 	require.NoError(t, err)
 
+	// Create a simple key manager for testing
+	keyManager := apikey.NewStaticKeyManager(map[string]string{
+		"test-tenant": "test-api-key",
+	})
+
 	// Create mock reverse proxy
-	reverseProxy, err := proxy.NewReverseProxy(cfg)
+	reverseProxy, err := proxy.NewReverseProxy(cfg, keyManager)
 	require.NoError(t, err)
 
 	// Create server
@@ -228,8 +239,13 @@ func TestMetricsEndpoint(t *testing.T) {
 	engine, err := opa.NewEngine(tmpDir)
 	require.NoError(t, err)
 
+	// Create a simple key manager for testing
+	keyManager := apikey.NewStaticKeyManager(map[string]string{
+		"test-tenant": "test-api-key",
+	})
+
 	// Create mock reverse proxy
-	reverseProxy, err := proxy.NewReverseProxy(cfg)
+	reverseProxy, err := proxy.NewReverseProxy(cfg, keyManager)
 	require.NoError(t, err)
 
 	// Create server
@@ -375,8 +391,13 @@ func TestMiddlewareChain(t *testing.T) {
 	engine, err := opa.NewEngine(tmpDir)
 	require.NoError(t, err)
 
+	// Create a simple key manager for testing
+	keyManager := apikey.NewStaticKeyManager(map[string]string{
+		"test-tenant": "test-api-key",
+	})
+
 	// Create mock reverse proxy
-	reverseProxy, err := proxy.NewReverseProxy(cfg)
+	reverseProxy, err := proxy.NewReverseProxy(cfg, keyManager)
 	require.NoError(t, err)
 
 	// Create server

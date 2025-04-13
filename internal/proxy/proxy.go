@@ -3,6 +3,8 @@ package proxy
 
 import (
 	"fmt"
+	"github.com/emphereio/auth-proxy/internal/apikey"
+	"github.com/emphereio/auth-proxy/internal/middleware"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -15,12 +17,13 @@ import (
 
 // ReverseProxy wraps httputil.ReverseProxy with additional functionality
 type ReverseProxy struct {
-	proxy *httputil.ReverseProxy
-	cfg   *config.Config
+	proxy      *httputil.ReverseProxy
+	cfg        *config.Config
+	keyManager apikey.KeyManager
 }
 
 // NewReverseProxy creates a new reverse proxy instance
-func NewReverseProxy(cfg *config.Config) (*ReverseProxy, error) {
+func NewReverseProxy(cfg *config.Config, keyManager apikey.KeyManager) (*ReverseProxy, error) {
 	// Construct backend URL
 	backend := fmt.Sprintf("http://%s:%s", cfg.BackendHost, cfg.BackendPort)
 	backendURL, err := url.Parse(backend)
@@ -31,11 +34,17 @@ func NewReverseProxy(cfg *config.Config) (*ReverseProxy, error) {
 	// Create standard reverse proxy
 	proxy := httputil.NewSingleHostReverseProxy(backendURL)
 
+	p := &ReverseProxy{
+		proxy:      proxy,
+		cfg:        cfg,
+		keyManager: keyManager,
+	}
+
 	// Customize director to modify requests
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
-		customizeRequest(req)
+		p.customizeRequest(req)
 	}
 
 	// Add error handler
@@ -44,10 +53,7 @@ func NewReverseProxy(cfg *config.Config) (*ReverseProxy, error) {
 	// Add response modifier
 	proxy.ModifyResponse = createResponseModifier()
 
-	return &ReverseProxy{
-		proxy: proxy,
-		cfg:   cfg,
-	}, nil
+	return p, nil
 }
 
 // ServeHTTP implements the http.Handler interface
@@ -56,7 +62,26 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // customizeRequest modifies the request before sending to backend
-func customizeRequest(req *http.Request) {
+func (p *ReverseProxy) customizeRequest(req *http.Request) {
+	// Get tenant ID from the request header
+	tenantID, ok := middleware.GetTenantIDFromHeader(req)
+	if ok && p.keyManager != nil {
+		// Lookup the appropriate API key for this tenant
+		apiKey := p.keyManager.GetKeyForTenant(tenantID)
+		if apiKey != "" {
+			// Set the API key header
+			req.Header.Set("x-api-key", apiKey)
+			log.Debug().
+				Str("tenantID", tenantID).
+				Str("path", req.URL.Path).
+				Msg("Injected API key for tenant")
+		} else {
+			log.Debug().
+				Str("tenantID", tenantID).
+				Str("path", req.URL.Path).
+				Msg("No API key found for tenant")
+		}
+	}
 	// Set appropriate headers for proxying
 	if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
 		// If X-Forwarded-For exists, append the client IP
