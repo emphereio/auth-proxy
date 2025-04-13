@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"github.com/emphereio/auth-proxy/internal/apikey"
 	"net/http"
 	"os"
 	"os/signal"
@@ -77,8 +78,13 @@ func TestMainIntegration(t *testing.T) {
 	go watcher.Start()
 	defer watcher.Stop()
 
+	// Create a simple key manager for testing
+	keyManager := apikey.NewStaticKeyManager(map[string]string{
+		"test-tenant": "test-api-key",
+	})
+
 	// Create reverse proxy
-	reverseProxy, err := proxy.NewReverseProxy(cfg)
+	reverseProxy, err := proxy.NewReverseProxy(cfg, keyManager)
 	require.NoError(t, err)
 
 	// Create and start HTTP server
@@ -176,12 +182,17 @@ func TestMainIntegrationWithServerError(t *testing.T) {
 	cfg, err := config.Load()
 	require.NoError(t, err)
 
+	// Create a simple key manager for testing
+	keyManager := apikey.NewStaticKeyManager(map[string]string{
+		"test-tenant": "test-api-key",
+	})
+
 	// Initialize OPA engine
 	opaEngine, err := opa.NewEngine(cfg.PolicyDir)
 	require.NoError(t, err)
 
 	// Create reverse proxy
-	reverseProxy, err := proxy.NewReverseProxy(cfg)
+	reverseProxy, err := proxy.NewReverseProxy(cfg, keyManager)
 	require.NoError(t, err)
 
 	// Create server

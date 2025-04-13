@@ -412,3 +412,17 @@ allow {
 		})
 	}
 }
+
+func TestGetTenantIDFromHeader(t *testing.T) {
+	req := httptest.NewRequest("GET", "http://example.com", nil)
+	req.Header.Set("X-Tenant-ID", "test-tenant-123")
+
+	tenantID, ok := GetTenantIDFromHeader(req)
+	assert.True(t, ok)
+	assert.Equal(t, "test-tenant-123", tenantID)
+
+	req.Header.Del("X-Tenant-ID")
+	tenantID, ok = GetTenantIDFromHeader(req)
+	assert.False(t, ok)
+	assert.Empty(t, tenantID)
+}
